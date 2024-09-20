@@ -1,850 +1,1483 @@
 """
-Generalized Linear Models.
+Base IO code for all datasets
 """
 
-# Author: Alexandre Gramfort <alexandre.gramfort@inria.fr>
-# Fabian Pedregosa <fabian.pedregosa@inria.fr>
-# Olivier Grisel <olivier.grisel@ensta.org>
-#         Vincent Michel <vincent.michel@inria.fr>
-#         Peter Prettenhofer <peter.prettenhofer@gmail.com>
-#         Mathieu Blondel <mathieu@mblondel.org>
-#         Lars Buitinck
-#         Maryan Morel <maryan.morel@polytechnique.edu>
-#         Giorgio Patrini <giorgio.patrini@anu.edu.au>
-#         Maria Telenczuk <https://github.com/maikia>
+# Copyright (c) 2007 David Cournapeau <cournape@gmail.com>
+#               2010 Fabian Pedregosa <fabian.pedregosa@inria.fr>
+#               2010 Olivier Grisel <olivier.grisel@ensta.org>
 # License: BSD 3 clause
-
-import numbers
+import csv
+import gzip
+import hashlib
+import os
+import shutil
+import time
 import warnings
-from abc import ABCMeta, abstractmethod
+from collections import namedtuple
+from importlib import resources
 from numbers import Integral
+from os import environ, listdir, makedirs
+from os.path import expanduser, isdir, join, splitext
+from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlretrieve
 
 import numpy as np
-import scipy.sparse as sp
-from scipy import linalg, optimize, sparse
-from scipy.sparse.linalg import lsqr
-from scipy.special import expit
 
-from ..base import (
-    BaseEstimator,
-    ClassifierMixin,
-    MultiOutputMixin,
-    RegressorMixin,
-    _fit_context,
+from ..preprocessing import scale
+from ..utils import Bunch, check_random_state
+from ..utils._optional_dependencies import check_pandas_support
+from ..utils._param_validation import Interval, StrOptions, validate_params
+
+DATA_MODULE = "sklearn.datasets.data"
+DESCR_MODULE = "sklearn.datasets.descr"
+IMAGES_MODULE = "sklearn.datasets.images"
+
+RemoteFileMetadata = namedtuple("RemoteFileMetadata", ["filename", "url", "checksum"])
+
+
+@validate_params(
+    {
+        "data_home": [str, os.PathLike, None],
+    },
+    prefer_skip_nested_validation=True,
 )
-from ..utils import check_array, check_random_state
-from ..utils._array_api import (
-    _asarray_with_order,
-    _average,
-    get_namespace,
-    get_namespace_and_device,
-    indexing_dtype,
-    supported_float_dtypes,
-)
-from ..utils._seq_dataset import (
-    ArrayDataset32,
-    ArrayDataset64,
-    CSRDataset32,
-    CSRDataset64,
-)
-from ..utils.extmath import safe_sparse_dot
-from ..utils.parallel import Parallel, delayed
-from ..utils.sparsefuncs import mean_variance_axis
-from ..utils.validation import _check_sample_weight, check_is_fitted
+def get_data_home(data_home=None) -> str:
+    """Return the path of the scikit-learn data directory.
 
-# TODO: bayesian_ridge_regression and bayesian_regression_ard
-# should be squashed into its respective objects.
+    This folder is used by some large dataset loaders to avoid downloading the
+    data several times.
 
-SPARSE_INTERCEPT_DECAY = 0.01
-# For sparse data intercept updates are scaled by this decay factor to avoid
-# intercept oscillation.
+    By default the data directory is set to a folder named 'scikit_learn_data' in the
+    user home folder.
 
+    Alternatively, it can be set by the 'SCIKIT_LEARN_DATA' environment
+    variable or programmatically by giving an explicit folder path. The '~'
+    symbol is expanded to the user home folder.
 
-def make_dataset(X, y, sample_weight, random_state=None):
-    """Create ``Dataset`` abstraction for sparse and dense inputs.
-
-    This also returns the ``intercept_decay`` which is different
-    for sparse datasets.
+    If the folder does not already exist, it is automatically created.
 
     Parameters
     ----------
-    X : array-like, shape (n_samples, n_features)
-        Training data
-
-    y : array-like, shape (n_samples, )
-        Target values.
-
-    sample_weight : numpy array of shape (n_samples,)
-        The weight of each sample
-
-    random_state : int, RandomState instance or None (default)
-        Determines random number generation for dataset random sampling. It is not
-        used for dataset shuffling.
-        Pass an int for reproducible output across multiple function calls.
-        See :term:`Glossary <random_state>`.
+    data_home : str or path-like, default=None
+        The path to scikit-learn data directory. If `None`, the default path
+        is `~/scikit_learn_data`.
 
     Returns
     -------
-    dataset
-        The ``Dataset`` abstraction
-    intercept_decay
-        The intercept decay
-    """
-
-    rng = check_random_state(random_state)
-    # seed should never be 0 in SequentialDataset64
-    seed = rng.randint(1, np.iinfo(np.int32).max)
-
-    if X.dtype == np.float32:
-        CSRData = CSRDataset32
-        ArrayData = ArrayDataset32
-    else:
-        CSRData = CSRDataset64
-        ArrayData = ArrayDataset64
-
-    if sp.issparse(X):
-        dataset = CSRData(X.data, X.indptr, X.indices, y, sample_weight, seed=seed)
-        intercept_decay = SPARSE_INTERCEPT_DECAY
-    else:
-        X = np.ascontiguousarray(X)
-        dataset = ArrayData(X, y, sample_weight, seed=seed)
-        intercept_decay = 1.0
-
-    return dataset, intercept_decay
-
-
-def _preprocess_data(
-    X,
-    y,
-    *,
-    fit_intercept,
-    copy=True,
-    copy_y=True,
-    sample_weight=None,
-    check_input=True,
-):
-    """Common data preprocessing for fitting linear models.
-
-    This helper is in charge of the following steps:
-
-    - Ensure that `sample_weight` is an array or `None`.
-    - If `check_input=True`, perform standard input validation of `X`, `y`.
-    - Perform copies if requested to avoid side-effects in case of inplace
-      modifications of the input.
-
-    Then, if `fit_intercept=True` this preprocessing centers both `X` and `y` as
-    follows:
-        - if `X` is dense, center the data and
-        store the mean vector in `X_offset`.
-        - if `X` is sparse, store the mean in `X_offset`
-        without centering `X`. The centering is expected to be handled by the
-        linear solver where appropriate.
-        - in either case, always center `y` and store the mean in `y_offset`.
-        - both `X_offset` and `y_offset` are always weighted by `sample_weight`
-          if not set to `None`.
-
-    If `fit_intercept=False`, no centering is performed and `X_offset`, `y_offset`
-    are set to zero.
-
-    Returns
-    -------
-    X_out : {ndarray, sparse matrix} of shape (n_samples, n_features)
-        If copy=True a copy of the input X is triggered, otherwise operations are
-        inplace.
-        If input X is dense, then X_out is centered.
-    y_out : {ndarray, sparse matrix} of shape (n_samples,) or (n_samples, n_targets)
-        Centered version of y. Possibly performed inplace on input y depending
-        on the copy_y parameter.
-    X_offset : ndarray of shape (n_features,)
-        The mean per column of input X.
-    y_offset : float or ndarray of shape (n_features,)
-    X_scale : ndarray of shape (n_features,)
-        Always an array of ones. TODO: refactor the code base to make it
-        possible to remove this unused variable.
-    """
-    xp, _, device_ = get_namespace_and_device(X, y, sample_weight)
-    n_samples, n_features = X.shape
-    X_is_sparse = sp.issparse(X)
-
-    if isinstance(sample_weight, numbers.Number):
-        sample_weight = None
-    if sample_weight is not None:
-        sample_weight = xp.asarray(sample_weight)
-
-    if check_input:
-        X = check_array(
-            X, copy=copy, accept_sparse=["csr", "csc"], dtype=supported_float_dtypes(xp)
-        )
-        y = check_array(y, dtype=X.dtype, copy=copy_y, ensure_2d=False)
-    else:
-        y = xp.astype(y, X.dtype, copy=copy_y)
-        if copy:
-            if X_is_sparse:
-                X = X.copy()
-            else:
-                X = _asarray_with_order(X, order="K", copy=True, xp=xp)
-
-    dtype_ = X.dtype
-
-    if fit_intercept:
-        if X_is_sparse:
-            X_offset, X_var = mean_variance_axis(X, axis=0, weights=sample_weight)
-        else:
-            X_offset = _average(X, axis=0, weights=sample_weight, xp=xp)
-
-            X_offset = xp.astype(X_offset, X.dtype, copy=False)
-            X -= X_offset
-
-        y_offset = _average(y, axis=0, weights=sample_weight, xp=xp)
-        y -= y_offset
-    else:
-        X_offset = xp.zeros(n_features, dtype=X.dtype, device=device_)
-        if y.ndim == 1:
-            y_offset = xp.asarray(0.0, dtype=dtype_, device=device_)
-        else:
-            y_offset = xp.zeros(y.shape[1], dtype=dtype_, device=device_)
-
-    # XXX: X_scale is no longer needed. It is an historic artifact from the
-    # time where linear model exposed the normalize parameter.
-    X_scale = xp.ones(n_features, dtype=X.dtype, device=device_)
-    return X, y, X_offset, y_offset, X_scale
-
-
-# TODO: _rescale_data should be factored into _preprocess_data.
-# Currently, the fact that sag implements its own way to deal with
-# sample_weight makes the refactoring tricky.
-
-
-def _rescale_data(X, y, sample_weight, inplace=False):
-    """Rescale data sample-wise by square root of sample_weight.
-
-    For many linear models, this enables easy support for sample_weight because
-
-        (y - X w)' S (y - X w)
-
-    with S = diag(sample_weight) becomes
-
-        ||y_rescaled - X_rescaled w||_2^2
-
-    when setting
-
-        y_rescaled = sqrt(S) y
-        X_rescaled = sqrt(S) X
-
-    Returns
-    -------
-    X_rescaled : {array-like, sparse matrix}
-
-    y_rescaled : {array-like, sparse matrix}
-    """
-    # Assume that _validate_data and _check_sample_weight have been called by
-    # the caller.
-    xp, _ = get_namespace(X, y, sample_weight)
-    n_samples = X.shape[0]
-    sample_weight_sqrt = xp.sqrt(sample_weight)
-
-    if sp.issparse(X) or sp.issparse(y):
-        sw_matrix = sparse.dia_matrix(
-            (sample_weight_sqrt, 0), shape=(n_samples, n_samples)
-        )
-
-    if sp.issparse(X):
-        X = safe_sparse_dot(sw_matrix, X)
-    else:
-        if inplace:
-            X *= sample_weight_sqrt[:, None]
-        else:
-            X = X * sample_weight_sqrt[:, None]
-
-    if sp.issparse(y):
-        y = safe_sparse_dot(sw_matrix, y)
-    else:
-        if inplace:
-            if y.ndim == 1:
-                y *= sample_weight_sqrt
-            else:
-                y *= sample_weight_sqrt[:, None]
-        else:
-            if y.ndim == 1:
-                y = y * sample_weight_sqrt
-            else:
-                y = y * sample_weight_sqrt[:, None]
-    return X, y, sample_weight_sqrt
-
-
-class LinearModel(BaseEstimator, metaclass=ABCMeta):
-    """Base class for Linear Models"""
-
-    @abstractmethod
-    def fit(self, X, y):
-        """Fit model."""
-
-    def _decision_function(self, X):
-        check_is_fitted(self)
-
-        X = self._validate_data(X, accept_sparse=["csr", "csc", "coo"], reset=False)
-        coef_ = self.coef_
-        if coef_.ndim == 1:
-            return X @ coef_ + self.intercept_
-        else:
-            return X @ coef_.T + self.intercept_
-
-    def predict(self, X):
-        """
-        Predict using the linear model.
-
-        Parameters
-        ----------
-        X : array-like or sparse matrix, shape (n_samples, n_features)
-            Samples.
-
-        Returns
-        -------
-        C : array, shape (n_samples,)
-            Returns predicted values.
-        """
-        return self._decision_function(X)
-
-    def _set_intercept(self, X_offset, y_offset, X_scale):
-        """Set the intercept_"""
-
-        xp, _ = get_namespace(X_offset, y_offset, X_scale)
-
-        if self.fit_intercept:
-            # We always want coef_.dtype=X.dtype. For instance, X.dtype can differ from
-            # coef_.dtype if warm_start=True.
-            coef_ = xp.astype(self.coef_, X_scale.dtype, copy=False)
-            coef_ = self.coef_ = xp.divide(coef_, X_scale)
-
-            if coef_.ndim == 1:
-                intercept_ = y_offset - X_offset @ coef_
-            else:
-                intercept_ = y_offset - X_offset @ coef_.T
-
-            self.intercept_ = intercept_
-
-        else:
-            self.intercept_ = 0.0
-
-    def _more_tags(self):
-        return {"requires_y": True}
-
-
-# XXX Should this derive from LinearModel? It should be a mixin, not an ABC.
-# Maybe the n_features checking can be moved to LinearModel.
-class LinearClassifierMixin(ClassifierMixin):
-    """Mixin for linear classifiers.
-
-    Handles prediction for sparse and dense X.
-    """
-
-    def decision_function(self, X):
-        """
-        Predict confidence scores for samples.
-
-        The confidence score for a sample is proportional to the signed
-        distance of that sample to the hyperplane.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features)
-            The data matrix for which we want to get the confidence scores.
-
-        Returns
-        -------
-        scores : ndarray of shape (n_samples,) or (n_samples, n_classes)
-            Confidence scores per `(n_samples, n_classes)` combination. In the
-            binary case, confidence score for `self.classes_[1]` where >0 means
-            this class would be predicted.
-        """
-        check_is_fitted(self)
-        xp, _ = get_namespace(X)
-
-        X = self._validate_data(X, accept_sparse="csr", reset=False)
-        scores = safe_sparse_dot(X, self.coef_.T, dense_output=True) + self.intercept_
-        return xp.reshape(scores, (-1,)) if scores.shape[1] == 1 else scores
-
-    def predict(self, X):
-        """
-        Predict class labels for samples in X.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features)
-            The data matrix for which we want to get the predictions.
-
-        Returns
-        -------
-        y_pred : ndarray of shape (n_samples,)
-            Vector containing the class labels for each sample.
-        """
-        xp, _ = get_namespace(X)
-        scores = self.decision_function(X)
-        if len(scores.shape) == 1:
-            indices = xp.astype(scores > 0, indexing_dtype(xp))
-        else:
-            indices = xp.argmax(scores, axis=1)
-
-        return xp.take(self.classes_, indices, axis=0)
-
-    def _predict_proba_lr(self, X):
-        """Probability estimation for OvR logistic regression.
-
-        Positive class probabilities are computed as
-        1. / (1. + np.exp(-self.decision_function(X)));
-        multiclass is handled by normalizing that over all classes.
-        """
-        prob = self.decision_function(X)
-        expit(prob, out=prob)
-        if prob.ndim == 1:
-            return np.vstack([1 - prob, prob]).T
-        else:
-            # OvR normalization, like LibLinear's predict_probability
-            prob /= prob.sum(axis=1).reshape((prob.shape[0], -1))
-            return prob
-
-
-class SparseCoefMixin:
-    """Mixin for converting coef_ to and from CSR format.
-
-    L1-regularizing estimators should inherit this.
-    """
-
-    def densify(self):
-        """
-        Convert coefficient matrix to dense array format.
-
-        Converts the ``coef_`` member (back) to a numpy.ndarray. This is the
-        default format of ``coef_`` and is required for fitting, so calling
-        this method is only required on models that have previously been
-        sparsified; otherwise, it is a no-op.
-
-        Returns
-        -------
-        self
-            Fitted estimator.
-        """
-        msg = "Estimator, %(name)s, must be fitted before densifying."
-        check_is_fitted(self, msg=msg)
-        if sp.issparse(self.coef_):
-            self.coef_ = self.coef_.toarray()
-        return self
-
-    def sparsify(self):
-        """
-        Convert coefficient matrix to sparse format.
-
-        Converts the ``coef_`` member to a scipy.sparse matrix, which for
-        L1-regularized models can be much more memory- and storage-efficient
-        than the usual numpy.ndarray representation.
-
-        The ``intercept_`` member is not converted.
-
-        Returns
-        -------
-        self
-            Fitted estimator.
-
-        Notes
-        -----
-        For non-sparse models, i.e. when there are not many zeros in ``coef_``,
-        this may actually *increase* memory usage, so use this method with
-        care. A rule of thumb is that the number of zero elements, which can
-        be computed with ``(coef_ == 0).sum()``, must be more than 50% for this
-        to provide significant benefits.
-
-        After calling this method, further fitting with the partial_fit
-        method (if any) will not work until you call densify.
-        """
-        msg = "Estimator, %(name)s, must be fitted before sparsifying."
-        check_is_fitted(self, msg=msg)
-        self.coef_ = sp.csr_matrix(self.coef_)
-        return self
-
-
-class LinearRegression(MultiOutputMixin, RegressorMixin, LinearModel):
-    """
-    Ordinary least squares Linear Regression.
-
-    LinearRegression fits a linear model with coefficients w = (w1, ..., wp)
-    to minimize the residual sum of squares between the observed targets in
-    the dataset, and the targets predicted by the linear approximation.
-
-    Parameters
-    ----------
-    fit_intercept : bool, default=True
-        Whether to calculate the intercept for this model. If set
-        to False, no intercept will be used in calculations
-        (i.e. data is expected to be centered).
-
-    copy_X : bool, default=True
-        If True, X will be copied; else, it may be overwritten.
-
-    n_jobs : int, default=None
-        The number of jobs to use for the computation. This will only provide
-        speedup in case of sufficiently large problems, that is if firstly
-        `n_targets > 1` and secondly `X` is sparse or if `positive` is set
-        to `True`. ``None`` means 1 unless in a
-        :obj:`joblib.parallel_backend` context. ``-1`` means using all
-        processors. See :term:`Glossary <n_jobs>` for more details.
-
-    positive : bool, default=False
-        When set to ``True``, forces the coefficients to be positive. This
-        option is only supported for dense arrays.
-
-        .. versionadded:: 0.24
-
-    Attributes
-    ----------
-    coef_ : array of shape (n_features, ) or (n_targets, n_features)
-        Estimated coefficients for the linear regression problem.
-        If multiple targets are passed during the fit (y 2D), this
-        is a 2D array of shape (n_targets, n_features), while if only
-        one target is passed, this is a 1D array of length n_features.
-
-    rank_ : int
-        Rank of matrix `X`. Only available when `X` is dense.
-
-    singular_ : array of shape (min(X, y),)
-        Singular values of `X`. Only available when `X` is dense.
-
-    intercept_ : float or array of shape (n_targets,)
-        Independent term in the linear model. Set to 0.0 if
-        `fit_intercept = False`.
-
-    n_features_in_ : int
-        Number of features seen during :term:`fit`.
-
-        .. versionadded:: 0.24
-
-    feature_names_in_ : ndarray of shape (`n_features_in_`,)
-        Names of features seen during :term:`fit`. Defined only when `X`
-        has feature names that are all strings.
-
-        .. versionadded:: 1.0
-
-    See Also
-    --------
-    Ridge : Ridge regression addresses some of the
-        problems of Ordinary Least Squares by imposing a penalty on the
-        size of the coefficients with l2 regularization.
-    Lasso : The Lasso is a linear model that estimates
-        sparse coefficients with l1 regularization.
-    ElasticNet : Elastic-Net is a linear regression
-        model trained with both l1 and l2 -norm regularization of the
-        coefficients.
-
-    Notes
-    -----
-    From the implementation point of view, this is just plain Ordinary
-    Least Squares (scipy.linalg.lstsq) or Non Negative Least Squares
-    (scipy.optimize.nnls) wrapped as a predictor object.
+    data_home: str
+        The path to scikit-learn data directory.
 
     Examples
     --------
-    >>> import numpy as np
-    >>> from sklearn.linear_model import LinearRegression
-    >>> X = np.array([[1, 1], [1, 2], [2, 2], [2, 3]])
-    >>> # y = 1 * x_0 + 2 * x_1 + 3
-    >>> y = np.dot(X, np.array([1, 2])) + 3
-    >>> reg = LinearRegression().fit(X, y)
-    >>> reg.score(X, y)
-    1.0
-    >>> reg.coef_
-    array([1., 2.])
-    >>> reg.intercept_
-    3.0...
-    >>> reg.predict(np.array([[3, 5]]))
-    array([16.])
+    >>> import os
+    >>> from sklearn.datasets import get_data_home
+    >>> data_home_path = get_data_home()
+    >>> os.path.exists(data_home_path)
+    True
     """
-
-    _parameter_constraints: dict = {
-        "fit_intercept": ["boolean"],
-        "copy_X": ["boolean"],
-        "n_jobs": [None, Integral],
-        "positive": ["boolean"],
-    }
-
-    def __init__(
-        self,
-        *,
-        fit_intercept=True,
-        copy_X=True,
-        n_jobs=None,
-        positive=False,
-    ):
-        self.fit_intercept = fit_intercept
-        self.copy_X = copy_X
-        self.n_jobs = n_jobs
-        self.positive = positive
-
-    @_fit_context(prefer_skip_nested_validation=True)
-    def fit(self, X, y, sample_weight=None):
-        """
-        Fit linear model.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features)
-            Training data.
-
-        y : array-like of shape (n_samples,) or (n_samples, n_targets)
-            Target values. Will be cast to X's dtype if necessary.
-
-        sample_weight : array-like of shape (n_samples,), default=None
-            Individual weights for each sample.
-
-            .. versionadded:: 0.17
-               parameter *sample_weight* support to LinearRegression.
-
-        Returns
-        -------
-        self : object
-            Fitted Estimator.
-        """
-        n_jobs_ = self.n_jobs
-
-        accept_sparse = False if self.positive else ["csr", "csc", "coo"]
-
-        X, y = self._validate_data(
-            X,
-            y,
-            accept_sparse=accept_sparse,
-            y_numeric=True,
-            multi_output=True,
-            force_writeable=True,
-        )
-
-        has_sw = sample_weight is not None
-        if has_sw:
-            sample_weight = _check_sample_weight(
-                sample_weight, X, dtype=X.dtype, only_non_negative=True
-            )
-
-        # Note that neither _rescale_data nor the rest of the fit method of
-        # LinearRegression can benefit from in-place operations when X is a
-        # sparse matrix. Therefore, let's not copy X when it is sparse.
-        copy_X_in_preprocess_data = self.copy_X and not sp.issparse(X)
-
-        X, y, X_offset, y_offset, X_scale = _preprocess_data(
-            X,
-            y,
-            fit_intercept=self.fit_intercept,
-            copy=copy_X_in_preprocess_data,
-            sample_weight=sample_weight,
-        )
-
-        if has_sw:
-            # Sample weight can be implemented via a simple rescaling. Note
-            # that we safely do inplace rescaling when _preprocess_data has
-            # already made a copy if requested.
-            X, y, sample_weight_sqrt = _rescale_data(
-                X, y, sample_weight, inplace=copy_X_in_preprocess_data
-            )
-
-        if self.positive:
-            if y.ndim < 2:
-                self.coef_ = optimize.nnls(X, y)[0]
-            else:
-                # scipy.optimize.nnls cannot handle y with shape (M, K)
-                outs = Parallel(n_jobs=n_jobs_)(
-                    delayed(optimize.nnls)(X, y[:, j]) for j in range(y.shape[1])
-                )
-                self.coef_ = np.vstack([out[0] for out in outs])
-        elif sp.issparse(X):
-            X_offset_scale = X_offset / X_scale
-
-            if has_sw:
-
-                def matvec(b):
-                    return X.dot(b) - sample_weight_sqrt * b.dot(X_offset_scale)
-
-                def rmatvec(b):
-                    return X.T.dot(b) - X_offset_scale * b.dot(sample_weight_sqrt)
-
-            else:
-
-                def matvec(b):
-                    return X.dot(b) - b.dot(X_offset_scale)
-
-                def rmatvec(b):
-                    return X.T.dot(b) - X_offset_scale * b.sum()
-
-            X_centered = sparse.linalg.LinearOperator(
-                shape=X.shape, matvec=matvec, rmatvec=rmatvec
-            )
-
-            if y.ndim < 2:
-                self.coef_ = lsqr(X_centered, y)[0]
-            else:
-                # sparse_lstsq cannot handle y with shape (M, K)
-                outs = Parallel(n_jobs=n_jobs_)(
-                    delayed(lsqr)(X_centered, y[:, j].ravel())
-                    for j in range(y.shape[1])
-                )
-                self.coef_ = np.vstack([out[0] for out in outs])
-        else:
-            self.coef_, _, self.rank_, self.singular_ = linalg.lstsq(X, y)
-            self.coef_ = self.coef_.T
-
-        if y.ndim == 1:
-            self.coef_ = np.ravel(self.coef_)
-        self._set_intercept(X_offset, y_offset, X_scale)
-        return self
+    if data_home is None:
+        data_home = environ.get("SCIKIT_LEARN_DATA", join("~", "scikit_learn_data"))
+    data_home = expanduser(data_home)
+    makedirs(data_home, exist_ok=True)
+    return data_home
 
 
-def _check_precomputed_gram_matrix(
-    X, precompute, X_offset, X_scale, rtol=None, atol=1e-5
-):
-    """Computes a single element of the gram matrix and compares it to
-    the corresponding element of the user supplied gram matrix.
-
-    If the values do not match a ValueError will be thrown.
+@validate_params(
+    {
+        "data_home": [str, os.PathLike, None],
+    },
+    prefer_skip_nested_validation=True,
+)
+def clear_data_home(data_home=None):
+    """Delete all the content of the data home cache.
 
     Parameters
     ----------
-    X : ndarray of shape (n_samples, n_features)
-        Data array.
+    data_home : str or path-like, default=None
+        The path to scikit-learn data directory. If `None`, the default path
+        is `~/scikit_learn_data`.
 
-    precompute : array-like of shape (n_features, n_features)
-        User-supplied gram matrix.
-
-    X_offset : ndarray of shape (n_features,)
-        Array of feature means used to center design matrix.
-
-    X_scale : ndarray of shape (n_features,)
-        Array of feature scale factors used to normalize design matrix.
-
-    rtol : float, default=None
-        Relative tolerance; see numpy.allclose
-        If None, it is set to 1e-4 for arrays of dtype numpy.float32 and 1e-7
-        otherwise.
-
-    atol : float, default=1e-5
-        absolute tolerance; see :func`numpy.allclose`. Note that the default
-        here is more tolerant than the default for
-        :func:`numpy.testing.assert_allclose`, where `atol=0`.
-
-    Raises
-    ------
-    ValueError
-        Raised when the provided Gram matrix is not consistent.
+    Examples
+    --------
+    >>> from sklearn.datasets import clear_data_home
+    >>> clear_data_home()  # doctest: +SKIP
     """
-
-    n_features = X.shape[1]
-    f1 = n_features // 2
-    f2 = min(f1 + 1, n_features - 1)
-
-    v1 = (X[:, f1] - X_offset[f1]) * X_scale[f1]
-    v2 = (X[:, f2] - X_offset[f2]) * X_scale[f2]
-
-    expected = np.dot(v1, v2)
-    actual = precompute[f1, f2]
-
-    dtypes = [precompute.dtype, expected.dtype]
-    if rtol is None:
-        rtols = [1e-4 if dtype == np.float32 else 1e-7 for dtype in dtypes]
-        rtol = max(rtols)
-
-    if not np.isclose(expected, actual, rtol=rtol, atol=atol):
-        raise ValueError(
-            "Gram matrix passed in via 'precompute' parameter "
-            "did not pass validation when a single element was "
-            "checked - please check that it was computed "
-            f"properly. For element ({f1},{f2}) we computed "
-            f"{expected} but the user-supplied value was "
-            f"{actual}."
-        )
+    data_home = get_data_home(data_home)
+    shutil.rmtree(data_home)
 
 
-def _pre_fit(
-    X,
-    y,
-    Xy,
-    precompute,
-    fit_intercept,
-    copy,
-    check_input=True,
-    sample_weight=None,
+def _convert_data_dataframe(
+    caller_name, data, target, feature_names, target_names, sparse_data=False
 ):
-    """Function used at beginning of fit in linear models with L1 or L0 penalty.
-
-    This function applies _preprocess_data and additionally computes the gram matrix
-    `precompute` as needed as well as `Xy`.
-    """
-    n_samples, n_features = X.shape
-
-    if sparse.issparse(X):
-        # copy is not needed here as X is not modified inplace when X is sparse
-        precompute = False
-        X, y, X_offset, y_offset, X_scale = _preprocess_data(
-            X,
-            y,
-            fit_intercept=fit_intercept,
-            copy=False,
-            check_input=check_input,
-            sample_weight=sample_weight,
-        )
+    pd = check_pandas_support("{} with as_frame=True".format(caller_name))
+    if not sparse_data:
+        data_df = pd.DataFrame(data, columns=feature_names, copy=False)
     else:
-        # copy was done in fit if necessary
-        X, y, X_offset, y_offset, X_scale = _preprocess_data(
-            X,
-            y,
-            fit_intercept=fit_intercept,
-            copy=copy,
-            check_input=check_input,
-            sample_weight=sample_weight,
-        )
-        # Rescale only in dense case. Sparse cd solver directly deals with
-        # sample_weight.
-        if sample_weight is not None:
-            # This triggers copies anyway.
-            X, y, _ = _rescale_data(X, y, sample_weight=sample_weight)
+        data_df = pd.DataFrame.sparse.from_spmatrix(data, columns=feature_names)
 
-    if hasattr(precompute, "__array__"):
-        if fit_intercept and not np.allclose(X_offset, np.zeros(n_features)):
-            warnings.warn(
-                (
-                    "Gram matrix was provided but X was centered to fit "
-                    "intercept: recomputing Gram matrix."
-                ),
-                UserWarning,
-            )
-            # TODO: instead of warning and recomputing, we could just center
-            # the user provided Gram matrix a-posteriori (after making a copy
-            # when `copy=True`).
-            # recompute Gram
-            precompute = "auto"
-            Xy = None
-        elif check_input:
-            # If we're going to use the user's precomputed gram matrix, we
-            # do a quick check to make sure its not totally bogus.
-            _check_precomputed_gram_matrix(X, precompute, X_offset, X_scale)
+    target_df = pd.DataFrame(target, columns=target_names)
+    combined_df = pd.concat([data_df, target_df], axis=1)
+    X = combined_df[feature_names]
+    y = combined_df[target_names]
+    if y.shape[1] == 1:
+        y = y.iloc[:, 0]
+    return combined_df, X, y
 
-    # precompute if n_samples > n_features
-    if isinstance(precompute, str) and precompute == "auto":
-        precompute = n_samples > n_features
 
-    if precompute is True:
-        # make sure that the 'precompute' array is contiguous.
-        precompute = np.empty(shape=(n_features, n_features), dtype=X.dtype, order="C")
-        np.dot(X.T, X, out=precompute)
+@validate_params(
+    {
+        "container_path": [str, os.PathLike],
+        "description": [str, None],
+        "categories": [list, None],
+        "load_content": ["boolean"],
+        "shuffle": ["boolean"],
+        "encoding": [str, None],
+        "decode_error": [StrOptions({"strict", "ignore", "replace"})],
+        "random_state": ["random_state"],
+        "allowed_extensions": [list, None],
+    },
+    prefer_skip_nested_validation=True,
+)
+def load_files(
+    container_path,
+    *,
+    description=None,
+    categories=None,
+    load_content=True,
+    shuffle=True,
+    encoding=None,
+    decode_error="strict",
+    random_state=0,
+    allowed_extensions=None,
+):
+    """Load text files with categories as subfolder names.
 
-    if not hasattr(precompute, "__array__"):
-        Xy = None  # cannot use Xy if precompute is not Gram
+    Individual samples are assumed to be files stored a two levels folder
+    structure such as the following:
 
-    if hasattr(precompute, "__array__") and Xy is None:
-        common_dtype = np.result_type(X.dtype, y.dtype)
-        if y.ndim == 1:
-            # Xy is 1d, make sure it is contiguous.
-            Xy = np.empty(shape=n_features, dtype=common_dtype, order="C")
-            np.dot(X.T, y, out=Xy)
+        container_folder/
+            category_1_folder/
+                file_1.txt
+                file_2.txt
+                ...
+                file_42.txt
+            category_2_folder/
+                file_43.txt
+                file_44.txt
+                ...
+
+    The folder names are used as supervised signal label names. The individual
+    file names are not important.
+
+    This function does not try to extract features into a numpy array or scipy
+    sparse matrix. In addition, if load_content is false it does not try to
+    load the files in memory.
+
+    To use text files in a scikit-learn classification or clustering algorithm,
+    you will need to use the :mod:`~sklearn.feature_extraction.text` module to
+    build a feature extraction transformer that suits your problem.
+
+    If you set load_content=True, you should also specify the encoding of the
+    text using the 'encoding' parameter. For many modern text files, 'utf-8'
+    will be the correct encoding. If you leave encoding equal to None, then the
+    content will be made of bytes instead of Unicode, and you will not be able
+    to use most functions in :mod:`~sklearn.feature_extraction.text`.
+
+    Similar feature extractors should be built for other kind of unstructured
+    data input such as images, audio, video, ...
+
+    If you want files with a specific file extension (e.g. `.txt`) then you
+    can pass a list of those file extensions to `allowed_extensions`.
+
+    Read more in the :ref:`User Guide <datasets>`.
+
+    Parameters
+    ----------
+    container_path : str
+        Path to the main folder holding one subfolder per category.
+
+    description : str, default=None
+        A paragraph describing the characteristic of the dataset: its source,
+        reference, etc.
+
+    categories : list of str, default=None
+        If None (default), load all the categories. If not None, list of
+        category names to load (other categories ignored).
+
+    load_content : bool, default=True
+        Whether to load or not the content of the different files. If true a
+        'data' attribute containing the text information is present in the data
+        structure returned. If not, a filenames attribute gives the path to the
+        files.
+
+    shuffle : bool, default=True
+        Whether or not to shuffle the data: might be important for models that
+        make the assumption that the samples are independent and identically
+        distributed (i.i.d.), such as stochastic gradient descent.
+
+    encoding : str, default=None
+        If None, do not try to decode the content of the files (e.g. for images
+        or other non-text content). If not None, encoding to use to decode text
+        files to Unicode if load_content is True.
+
+    decode_error : {'strict', 'ignore', 'replace'}, default='strict'
+        Instruction on what to do if a byte sequence is given to analyze that
+        contains characters not of the given `encoding`. Passed as keyword
+        argument 'errors' to bytes.decode.
+
+    random_state : int, RandomState instance or None, default=0
+        Determines random number generation for dataset shuffling. Pass an int
+        for reproducible output across multiple function calls.
+        See :term:`Glossary <random_state>`.
+
+    allowed_extensions : list of str, default=None
+        List of desired file extensions to filter the files to be loaded.
+
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
+
+        data : list of str
+            Only present when `load_content=True`.
+            The raw text data to learn.
+        target : ndarray
+            The target labels (integer index).
+        target_names : list
+            The names of target classes.
+        DESCR : str
+            The full description of the dataset.
+        filenames: ndarray
+            The filenames holding the dataset.
+
+    Examples
+    --------
+    >>> from sklearn.datasets import load_files
+    >>> container_path = "./"
+    >>> load_files(container_path)  # doctest: +SKIP
+    """
+
+    target = []
+    target_names = []
+    filenames = []
+
+    folders = [
+        f for f in sorted(listdir(container_path)) if isdir(join(container_path, f))
+    ]
+
+    if categories is not None:
+        folders = [f for f in folders if f in categories]
+
+    if allowed_extensions is not None:
+        allowed_extensions = frozenset(allowed_extensions)
+
+    for label, folder in enumerate(folders):
+        target_names.append(folder)
+        folder_path = join(container_path, folder)
+        files = sorted(listdir(folder_path))
+        if allowed_extensions is not None:
+            documents = [
+                join(folder_path, file)
+                for file in files
+                if os.path.splitext(file)[1] in allowed_extensions
+            ]
         else:
-            # Make sure that Xy is always F contiguous even if X or y are not
-            # contiguous: the goal is to make it fast to extract the data for a
-            # specific target.
-            n_targets = y.shape[1]
-            Xy = np.empty(shape=(n_features, n_targets), dtype=common_dtype, order="F")
-            np.dot(y.T, X, out=Xy.T)
+            documents = [join(folder_path, file) for file in files]
+        target.extend(len(documents) * [label])
+        filenames.extend(documents)
 
-    return X, y, X_offset, y_offset, X_scale, precompute, Xy
+    # convert to array for fancy indexing
+    filenames = np.array(filenames)
+    target = np.array(target)
+
+    if shuffle:
+        random_state = check_random_state(random_state)
+        indices = np.arange(filenames.shape[0])
+        random_state.shuffle(indices)
+        filenames = filenames[indices]
+        target = target[indices]
+
+    if load_content:
+        data = []
+        for filename in filenames:
+            data.append(Path(filename).read_bytes())
+        if encoding is not None:
+            data = [d.decode(encoding, decode_error) for d in data]
+        return Bunch(
+            data=data,
+            filenames=filenames,
+            target_names=target_names,
+            target=target,
+            DESCR=description,
+        )
+
+    return Bunch(
+        filenames=filenames, target_names=target_names, target=target, DESCR=description
+    )
+
+
+def load_csv_data(
+    data_file_name,
+    *,
+    data_module=DATA_MODULE,
+    descr_file_name=None,
+    descr_module=DESCR_MODULE,
+    encoding="utf-8",
+):
+    """Loads `data_file_name` from `data_module with `importlib.resources`.
+
+    Parameters
+    ----------
+    data_file_name : str
+        Name of csv file to be loaded from `data_module/data_file_name`.
+        For example `'wine_data.csv'`.
+
+    data_module : str or module, default='sklearn.datasets.data'
+        Module where data lives. The default is `'sklearn.datasets.data'`.
+
+    descr_file_name : str, default=None
+        Name of rst file to be loaded from `descr_module/descr_file_name`.
+        For example `'wine_data.rst'`. See also :func:`load_descr`.
+        If not None, also returns the corresponding description of
+        the dataset.
+
+    descr_module : str or module, default='sklearn.datasets.descr'
+        Module where `descr_file_name` lives. See also :func:`load_descr`.
+        The default is `'sklearn.datasets.descr'`.
+
+    Returns
+    -------
+    data : ndarray of shape (n_samples, n_features)
+        A 2D array with each row representing one sample and each column
+        representing the features of a given sample.
+
+    target : ndarry of shape (n_samples,)
+        A 1D array holding target variables for all the samples in `data`.
+        For example target[0] is the target variable for data[0].
+
+    target_names : ndarry of shape (n_samples,)
+        A 1D array containing the names of the classifications. For example
+        target_names[0] is the name of the target[0] class.
+
+    descr : str, optional
+        Description of the dataset (the content of `descr_file_name`).
+        Only returned if `descr_file_name` is not None.
+
+    encoding : str, optional
+        Text encoding of the CSV file.
+
+        .. versionadded:: 1.4
+    """
+    data_path = resources.files(data_module) / data_file_name
+    with data_path.open("r", encoding="utf-8") as csv_file:
+        data_file = csv.reader(csv_file)
+        temp = next(data_file)
+        n_samples = int(temp[0])
+        n_features = int(temp[1])
+        target_names = np.array(temp[2:])
+        data = np.empty((n_samples, n_features))
+        target = np.empty((n_samples,), dtype=int)
+
+        for i, ir in enumerate(data_file):
+            data[i] = np.asarray(ir[:-1], dtype=np.float64)
+            target[i] = np.asarray(ir[-1], dtype=int)
+
+    if descr_file_name is None:
+        return data, target, target_names
+    else:
+        assert descr_module is not None
+        descr = load_descr(descr_module=descr_module, descr_file_name=descr_file_name)
+        return data, target, target_names, descr
+
+
+def load_gzip_compressed_csv_data(
+    data_file_name,
+    *,
+    data_module=DATA_MODULE,
+    descr_file_name=None,
+    descr_module=DESCR_MODULE,
+    encoding="utf-8",
+    **kwargs,
+):
+    """Loads gzip-compressed with `importlib.resources`.
+
+    1) Open resource file with `importlib.resources.open_binary`
+    2) Decompress file obj with `gzip.open`
+    3) Load decompressed data with `np.loadtxt`
+
+    Parameters
+    ----------
+    data_file_name : str
+        Name of gzip-compressed csv file  (`'*.csv.gz'`) to be loaded from
+        `data_module/data_file_name`. For example `'diabetes_data.csv.gz'`.
+
+    data_module : str or module, default='sklearn.datasets.data'
+        Module where data lives. The default is `'sklearn.datasets.data'`.
+
+    descr_file_name : str, default=None
+        Name of rst file to be loaded from `descr_module/descr_file_name`.
+        For example `'wine_data.rst'`. See also :func:`load_descr`.
+        If not None, also returns the corresponding description of
+        the dataset.
+
+    descr_module : str or module, default='sklearn.datasets.descr'
+        Module where `descr_file_name` lives. See also :func:`load_descr`.
+        The default  is `'sklearn.datasets.descr'`.
+
+    encoding : str, default="utf-8"
+        Name of the encoding that the gzip-decompressed file will be
+        decoded with. The default is 'utf-8'.
+
+    **kwargs : dict, optional
+        Keyword arguments to be passed to `np.loadtxt`;
+        e.g. delimiter=','.
+
+    Returns
+    -------
+    data : ndarray of shape (n_samples, n_features)
+        A 2D array with each row representing one sample and each column
+        representing the features and/or target of a given sample.
+
+    descr : str, optional
+        Description of the dataset (the content of `descr_file_name`).
+        Only returned if `descr_file_name` is not None.
+    """
+    data_path = resources.files(data_module) / data_file_name
+    with data_path.open("rb") as compressed_file:
+        compressed_file = gzip.open(compressed_file, mode="rt", encoding=encoding)
+        data = np.loadtxt(compressed_file, **kwargs)
+
+    if descr_file_name is None:
+        return data
+    else:
+        assert descr_module is not None
+        descr = load_descr(descr_module=descr_module, descr_file_name=descr_file_name)
+        return data, descr
+
+
+def load_descr(descr_file_name, *, descr_module=DESCR_MODULE, encoding="utf-8"):
+    """Load `descr_file_name` from `descr_module` with `importlib.resources`.
+
+    Parameters
+    ----------
+    descr_file_name : str, default=None
+        Name of rst file to be loaded from `descr_module/descr_file_name`.
+        For example `'wine_data.rst'`. See also :func:`load_descr`.
+        If not None, also returns the corresponding description of
+        the dataset.
+
+    descr_module : str or module, default='sklearn.datasets.descr'
+        Module where `descr_file_name` lives. See also :func:`load_descr`.
+        The default  is `'sklearn.datasets.descr'`.
+
+    encoding : str, default="utf-8"
+        Name of the encoding that `descr_file_name` will be decoded with.
+        The default is 'utf-8'.
+
+        .. versionadded:: 1.4
+
+    Returns
+    -------
+    fdescr : str
+        Content of `descr_file_name`.
+    """
+    path = resources.files(descr_module) / descr_file_name
+    return path.read_text(encoding=encoding)
+
+
+@validate_params(
+    {
+        "return_X_y": ["boolean"],
+        "as_frame": ["boolean"],
+    },
+    prefer_skip_nested_validation=True,
+)
+def load_wine(*, return_X_y=False, as_frame=False):
+    """Load and return the wine dataset (classification).
+
+    .. versionadded:: 0.18
+
+    The wine dataset is a classic and very easy multi-class classification
+    dataset.
+
+    =================   ==============
+    Classes                          3
+    Samples per class        [59,71,48]
+    Samples total                  178
+    Dimensionality                  13
+    Features            real, positive
+    =================   ==============
+
+    The copy of UCI ML Wine Data Set dataset is downloaded and modified to fit
+    standard format from:
+    https://archive.ics.uci.edu/ml/machine-learning-databases/wine/wine.data
+
+    Read more in the :ref:`User Guide <wine_dataset>`.
+
+    Parameters
+    ----------
+    return_X_y : bool, default=False
+        If True, returns ``(data, target)`` instead of a Bunch object.
+        See below for more information about the `data` and `target` object.
+
+    as_frame : bool, default=False
+        If True, the data is a pandas DataFrame including columns with
+        appropriate dtypes (numeric). The target is
+        a pandas DataFrame or Series depending on the number of target columns.
+        If `return_X_y` is True, then (`data`, `target`) will be pandas
+        DataFrames or Series as described below.
+
+        .. versionadded:: 0.23
+
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
+
+        data : {ndarray, dataframe} of shape (178, 13)
+            The data matrix. If `as_frame=True`, `data` will be a pandas
+            DataFrame.
+        target: {ndarray, Series} of shape (178,)
+            The classification target. If `as_frame=True`, `target` will be
+            a pandas Series.
+        feature_names: list
+            The names of the dataset columns.
+        target_names: list
+            The names of target classes.
+        frame: DataFrame of shape (178, 14)
+            Only present when `as_frame=True`. DataFrame with `data` and
+            `target`.
+
+            .. versionadded:: 0.23
+        DESCR: str
+            The full description of the dataset.
+
+    (data, target) : tuple if ``return_X_y`` is True
+        A tuple of two ndarrays by default. The first contains a 2D array of shape
+        (178, 13) with each row representing one sample and each column representing
+        the features. The second array of shape (178,) contains the target samples.
+
+    Examples
+    --------
+    Let's say you are interested in the samples 10, 80, and 140, and want to
+    know their class name.
+
+    >>> from sklearn.datasets import load_wine
+    >>> data = load_wine()
+    >>> data.target[[10, 80, 140]]
+    array([0, 1, 2])
+    >>> list(data.target_names)
+    ['class_0', 'class_1', 'class_2']
+    """
+
+    data, target, target_names, fdescr = load_csv_data(
+        data_file_name="wine_data.csv", descr_file_name="wine_data.rst"
+    )
+
+    feature_names = [
+        "alcohol",
+        "malic_acid",
+        "ash",
+        "alcalinity_of_ash",
+        "magnesium",
+        "total_phenols",
+        "flavanoids",
+        "nonflavanoid_phenols",
+        "proanthocyanins",
+        "color_intensity",
+        "hue",
+        "od280/od315_of_diluted_wines",
+        "proline",
+    ]
+
+    frame = None
+    target_columns = [
+        "target",
+    ]
+    if as_frame:
+        frame, data, target = _convert_data_dataframe(
+            "load_wine", data, target, feature_names, target_columns
+        )
+
+    if return_X_y:
+        return data, target
+
+    return Bunch(
+        data=data,
+        target=target,
+        frame=frame,
+        target_names=target_names,
+        DESCR=fdescr,
+        feature_names=feature_names,
+    )
+
+
+@validate_params(
+    {"return_X_y": ["boolean"], "as_frame": ["boolean"]},
+    prefer_skip_nested_validation=True,
+)
+def load_iris(*, return_X_y=False, as_frame=False):
+    """Load and return the iris dataset (classification).
+
+    The iris dataset is a classic and very easy multi-class classification
+    dataset.
+
+    =================   ==============
+    Classes                          3
+    Samples per class               50
+    Samples total                  150
+    Dimensionality                   4
+    Features            real, positive
+    =================   ==============
+
+    Read more in the :ref:`User Guide <iris_dataset>`.
+
+    Parameters
+    ----------
+    return_X_y : bool, default=False
+        If True, returns ``(data, target)`` instead of a Bunch object. See
+        below for more information about the `data` and `target` object.
+
+        .. versionadded:: 0.18
+
+    as_frame : bool, default=False
+        If True, the data is a pandas DataFrame including columns with
+        appropriate dtypes (numeric). The target is
+        a pandas DataFrame or Series depending on the number of target columns.
+        If `return_X_y` is True, then (`data`, `target`) will be pandas
+        DataFrames or Series as described below.
+
+        .. versionadded:: 0.23
+
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
+
+        data : {ndarray, dataframe} of shape (150, 4)
+            The data matrix. If `as_frame=True`, `data` will be a pandas
+            DataFrame.
+        target: {ndarray, Series} of shape (150,)
+            The classification target. If `as_frame=True`, `target` will be
+            a pandas Series.
+        feature_names: list
+            The names of the dataset columns.
+        target_names: list
+            The names of target classes.
+        frame: DataFrame of shape (150, 5)
+            Only present when `as_frame=True`. DataFrame with `data` and
+            `target`.
+
+            .. versionadded:: 0.23
+        DESCR: str
+            The full description of the dataset.
+        filename: str
+            The path to the location of the data.
+
+            .. versionadded:: 0.20
+
+    (data, target) : tuple if ``return_X_y`` is True
+        A tuple of two ndarray. The first containing a 2D array of shape
+        (n_samples, n_features) with each row representing one sample and
+        each column representing the features. The second ndarray of shape
+        (n_samples,) containing the target samples.
+
+        .. versionadded:: 0.18
+
+    Notes
+    -----
+        .. versionchanged:: 0.20
+            Fixed two wrong data points according to Fisher's paper.
+            The new version is the same as in R, but not as in the UCI
+            Machine Learning Repository.
+
+    Examples
+    --------
+    Let's say you are interested in the samples 10, 25, and 50, and want to
+    know their class name.
+
+    >>> from sklearn.datasets import load_iris
+    >>> data = load_iris()
+    >>> data.target[[10, 25, 50]]
+    array([0, 0, 1])
+    >>> list(data.target_names)
+    ['setosa', 'versicolor', 'virginica']
+
+    See :ref:`sphx_glr_auto_examples_datasets_plot_iris_dataset.py` for a more
+    detailed example of how to work with the iris dataset.
+    """
+    data_file_name = "iris.csv"
+    data, target, target_names, fdescr = load_csv_data(
+        data_file_name=data_file_name, descr_file_name="iris.rst"
+    )
+
+    feature_names = [
+        "sepal length (cm)",
+        "sepal width (cm)",
+        "petal length (cm)",
+        "petal width (cm)",
+    ]
+
+    frame = None
+    target_columns = [
+        "target",
+    ]
+    if as_frame:
+        frame, data, target = _convert_data_dataframe(
+            "load_iris", data, target, feature_names, target_columns
+        )
+
+    if return_X_y:
+        return data, target
+
+    return Bunch(
+        data=data,
+        target=target,
+        frame=frame,
+        target_names=target_names,
+        DESCR=fdescr,
+        feature_names=feature_names,
+        filename=data_file_name,
+        data_module=DATA_MODULE,
+    )
+
+
+@validate_params(
+    {"return_X_y": ["boolean"], "as_frame": ["boolean"]},
+    prefer_skip_nested_validation=True,
+)
+def load_breast_cancer(*, return_X_y=False, as_frame=False):
+    """Load and return the breast cancer wisconsin dataset (classification).
+
+    The breast cancer dataset is a classic and very easy binary classification
+    dataset.
+
+    =================   ==============
+    Classes                          2
+    Samples per class    212(M),357(B)
+    Samples total                  569
+    Dimensionality                  30
+    Features            real, positive
+    =================   ==============
+
+    The copy of UCI ML Breast Cancer Wisconsin (Diagnostic) dataset is
+    downloaded from:
+    https://archive.ics.uci.edu/dataset/17/breast+cancer+wisconsin+diagnostic
+
+    Read more in the :ref:`User Guide <breast_cancer_dataset>`.
+
+    Parameters
+    ----------
+    return_X_y : bool, default=False
+        If True, returns ``(data, target)`` instead of a Bunch object.
+        See below for more information about the `data` and `target` object.
+
+        .. versionadded:: 0.18
+
+    as_frame : bool, default=False
+        If True, the data is a pandas DataFrame including columns with
+        appropriate dtypes (numeric). The target is
+        a pandas DataFrame or Series depending on the number of target columns.
+        If `return_X_y` is True, then (`data`, `target`) will be pandas
+        DataFrames or Series as described below.
+
+        .. versionadded:: 0.23
+
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
+
+        data : {ndarray, dataframe} of shape (569, 30)
+            The data matrix. If `as_frame=True`, `data` will be a pandas
+            DataFrame.
+        target : {ndarray, Series} of shape (569,)
+            The classification target. If `as_frame=True`, `target` will be
+            a pandas Series.
+        feature_names : ndarray of shape (30,)
+            The names of the dataset columns.
+        target_names : ndarray of shape (2,)
+            The names of target classes.
+        frame : DataFrame of shape (569, 31)
+            Only present when `as_frame=True`. DataFrame with `data` and
+            `target`.
+
+            .. versionadded:: 0.23
+        DESCR : str
+            The full description of the dataset.
+        filename : str
+            The path to the location of the data.
+
+            .. versionadded:: 0.20
+
+    (data, target) : tuple if ``return_X_y`` is True
+        A tuple of two ndarrays by default. The first contains a 2D ndarray of
+        shape (569, 30) with each row representing one sample and each column
+        representing the features. The second ndarray of shape (569,) contains
+        the target samples.  If `as_frame=True`, both arrays are pandas objects,
+        i.e. `X` a dataframe and `y` a series.
+
+        .. versionadded:: 0.18
+
+    Examples
+    --------
+    Let's say you are interested in the samples 10, 50, and 85, and want to
+    know their class name.
+
+    >>> from sklearn.datasets import load_breast_cancer
+    >>> data = load_breast_cancer()
+    >>> data.target[[10, 50, 85]]
+    array([0, 1, 0])
+    >>> list(data.target_names)
+    ['malignant', 'benign']
+    """
+    data_file_name = "breast_cancer.csv"
+    data, target, target_names, fdescr = load_csv_data(
+        data_file_name=data_file_name, descr_file_name="breast_cancer.rst"
+    )
+
+    feature_names = np.array(
+        [
+            "mean radius",
+            "mean texture",
+            "mean perimeter",
+            "mean area",
+            "mean smoothness",
+            "mean compactness",
+            "mean concavity",
+            "mean concave points",
+            "mean symmetry",
+            "mean fractal dimension",
+            "radius error",
+            "texture error",
+            "perimeter error",
+            "area error",
+            "smoothness error",
+            "compactness error",
+            "concavity error",
+            "concave points error",
+            "symmetry error",
+            "fractal dimension error",
+            "worst radius",
+            "worst texture",
+            "worst perimeter",
+            "worst area",
+            "worst smoothness",
+            "worst compactness",
+            "worst concavity",
+            "worst concave points",
+            "worst symmetry",
+            "worst fractal dimension",
+        ]
+    )
+
+    frame = None
+    target_columns = [
+        "target",
+    ]
+    if as_frame:
+        frame, data, target = _convert_data_dataframe(
+            "load_breast_cancer", data, target, feature_names, target_columns
+        )
+
+    if return_X_y:
+        return data, target
+
+    return Bunch(
+        data=data,
+        target=target,
+        frame=frame,
+        target_names=target_names,
+        DESCR=fdescr,
+        feature_names=feature_names,
+        filename=data_file_name,
+        data_module=DATA_MODULE,
+    )
+
+
+@validate_params(
+    {
+        "n_class": [Interval(Integral, 1, 10, closed="both")],
+        "return_X_y": ["boolean"],
+        "as_frame": ["boolean"],
+    },
+    prefer_skip_nested_validation=True,
+)
+def load_digits(*, n_class=10, return_X_y=False, as_frame=False):
+    """Load and return the digits dataset (classification).
+
+    Each datapoint is a 8x8 image of a digit.
+
+    =================   ==============
+    Classes                         10
+    Samples per class             ~180
+    Samples total                 1797
+    Dimensionality                  64
+    Features             integers 0-16
+    =================   ==============
+
+    This is a copy of the test set of the UCI ML hand-written digits datasets
+    https://archive.ics.uci.edu/ml/datasets/Optical+Recognition+of+Handwritten+Digits
+
+    Read more in the :ref:`User Guide <digits_dataset>`.
+
+    Parameters
+    ----------
+    n_class : int, default=10
+        The number of classes to return. Between 0 and 10.
+
+    return_X_y : bool, default=False
+        If True, returns ``(data, target)`` instead of a Bunch object.
+        See below for more information about the `data` and `target` object.
+
+        .. versionadded:: 0.18
+
+    as_frame : bool, default=False
+        If True, the data is a pandas DataFrame including columns with
+        appropriate dtypes (numeric). The target is
+        a pandas DataFrame or Series depending on the number of target columns.
+        If `return_X_y` is True, then (`data`, `target`) will be pandas
+        DataFrames or Series as described below.
+
+        .. versionadded:: 0.23
+
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
+
+        data : {ndarray, dataframe} of shape (1797, 64)
+            The flattened data matrix. If `as_frame=True`, `data` will be
+            a pandas DataFrame.
+        target: {ndarray, Series} of shape (1797,)
+            The classification target. If `as_frame=True`, `target` will be
+            a pandas Series.
+        feature_names: list
+            The names of the dataset columns.
+        target_names: list
+            The names of target classes.
+
+            .. versionadded:: 0.20
+
+        frame: DataFrame of shape (1797, 65)
+            Only present when `as_frame=True`. DataFrame with `data` and
+            `target`.
+
+            .. versionadded:: 0.23
+        images: {ndarray} of shape (1797, 8, 8)
+            The raw image data.
+        DESCR: str
+            The full description of the dataset.
+
+    (data, target) : tuple if ``return_X_y`` is True
+        A tuple of two ndarrays by default. The first contains a 2D ndarray of
+        shape (1797, 64) with each row representing one sample and each column
+        representing the features. The second ndarray of shape (1797) contains
+        the target samples.  If `as_frame=True`, both arrays are pandas objects,
+        i.e. `X` a dataframe and `y` a series.
+
+        .. versionadded:: 0.18
+
+    Examples
+    --------
+    To load the data and visualize the images::
+
+        >>> from sklearn.datasets import load_digits
+        >>> digits = load_digits()
+        >>> print(digits.data.shape)
+        (1797, 64)
+        >>> import matplotlib.pyplot as plt
+        >>> plt.gray()
+        >>> plt.matshow(digits.images[0])
+        <...>
+        >>> plt.show()
+    """
+
+    data, fdescr = load_gzip_compressed_csv_data(
+        data_file_name="digits.csv.gz", descr_file_name="digits.rst", delimiter=","
+    )
+
+    target = data[:, -1].astype(int, copy=False)
+    flat_data = data[:, :-1]
+    images = flat_data.view()
+    images.shape = (-1, 8, 8)
+
+    if n_class < 10:
+        idx = target < n_class
+        flat_data, target = flat_data[idx], target[idx]
+        images = images[idx]
+
+    feature_names = [
+        "pixel_{}_{}".format(row_idx, col_idx)
+        for row_idx in range(8)
+        for col_idx in range(8)
+    ]
+
+    frame = None
+    target_columns = [
+        "target",
+    ]
+    if as_frame:
+        frame, flat_data, target = _convert_data_dataframe(
+            "load_digits", flat_data, target, feature_names, target_columns
+        )
+
+    if return_X_y:
+        return flat_data, target
+
+    return Bunch(
+        data=flat_data,
+        target=target,
+        frame=frame,
+        feature_names=feature_names,
+        target_names=np.arange(10),
+        images=images,
+        DESCR=fdescr,
+    )
+
+
+@validate_params(
+    {"return_X_y": ["boolean"], "as_frame": ["boolean"], "scaled": ["boolean"]},
+    prefer_skip_nested_validation=True,
+)
+def load_diabetes(*, return_X_y=False, as_frame=False, scaled=True):
+    """Load and return the diabetes dataset (regression).
+
+    ==============   ==================
+    Samples total    442
+    Dimensionality   10
+    Features         real, -.2 < x < .2
+    Targets          integer 25 - 346
+    ==============   ==================
+
+    .. note::
+       The meaning of each feature (i.e. `feature_names`) might be unclear
+       (especially for `ltg`) as the documentation of the original dataset is
+       not explicit. We provide information that seems correct in regard with
+       the scientific literature in this field of research.
+
+    Read more in the :ref:`User Guide <diabetes_dataset>`.
+
+    Parameters
+    ----------
+    return_X_y : bool, default=False
+        If True, returns ``(data, target)`` instead of a Bunch object.
+        See below for more information about the `data` and `target` object.
+
+        .. versionadded:: 0.18
+
+    as_frame : bool, default=False
+        If True, the data is a pandas DataFrame including columns with
+        appropriate dtypes (numeric). The target is
+        a pandas DataFrame or Series depending on the number of target columns.
+        If `return_X_y` is True, then (`data`, `target`) will be pandas
+        DataFrames or Series as described below.
+
+        .. versionadded:: 0.23
+
+    scaled : bool, default=True
+        If True, the feature variables are mean centered and scaled by the
+        standard deviation times the square root of `n_samples`.
+        If False, raw data is returned for the feature variables.
+
+        .. versionadded:: 1.1
+
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
+
+        data : {ndarray, dataframe} of shape (442, 10)
+            The data matrix. If `as_frame=True`, `data` will be a pandas
+            DataFrame.
+        target: {ndarray, Series} of shape (442,)
+            The regression target. If `as_frame=True`, `target` will be
+            a pandas Series.
+        feature_names: list
+            The names of the dataset columns.
+        frame: DataFrame of shape (442, 11)
+            Only present when `as_frame=True`. DataFrame with `data` and
+            `target`.
+
+            .. versionadded:: 0.23
+        DESCR: str
+            The full description of the dataset.
+        data_filename: str
+            The path to the location of the data.
+        target_filename: str
+            The path to the location of the target.
+
+    (data, target) : tuple if ``return_X_y`` is True
+        Returns a tuple of two ndarray of shape (n_samples, n_features)
+        A 2D array with each row representing one sample and each column
+        representing the features and/or target of a given sample.
+
+        .. versionadded:: 0.18
+
+    Examples
+    --------
+    >>> from sklearn.datasets import load_diabetes
+    >>> diabetes = load_diabetes()
+    >>> diabetes.target[:3]
+    array([151.,  75., 141.])
+    >>> diabetes.data.shape
+    (442, 10)
+    """
+    data_filename = "diabetes_data_raw.csv.gz"
+    target_filename = "diabetes_target.csv.gz"
+    data = load_gzip_compressed_csv_data(data_filename)
+    target = load_gzip_compressed_csv_data(target_filename)
+
+    if scaled:
+        data = scale(data, copy=False)
+        data /= data.shape[0] ** 0.5
+
+    fdescr = load_descr("diabetes.rst")
+
+    feature_names = ["age", "sex", "bmi", "bp", "s1", "s2", "s3", "s4", "s5", "s6"]
+
+    frame = None
+    target_columns = [
+        "target",
+    ]
+    if as_frame:
+        frame, data, target = _convert_data_dataframe(
+            "load_diabetes", data, target, feature_names, target_columns
+        )
+
+    if return_X_y:
+        return data, target
+
+    return Bunch(
+        data=data,
+        target=target,
+        frame=frame,
+        DESCR=fdescr,
+        feature_names=feature_names,
+        data_filename=data_filename,
+        target_filename=target_filename,
+        data_module=DATA_MODULE,
+    )
+
+
+@validate_params(
+    {
+        "return_X_y": ["boolean"],
+        "as_frame": ["boolean"],
+    },
+    prefer_skip_nested_validation=True,
+)
+def load_linnerud(*, return_X_y=False, as_frame=False):
+    """Load and return the physical exercise Linnerud dataset.
+
+    This dataset is suitable for multi-output regression tasks.
+
+    ==============   ============================
+    Samples total    20
+    Dimensionality   3 (for both data and target)
+    Features         integer
+    Targets          integer
+    ==============   ============================
+
+    Read more in the :ref:`User Guide <linnerrud_dataset>`.
+
+    Parameters
+    ----------
+    return_X_y : bool, default=False
+        If True, returns ``(data, target)`` instead of a Bunch object.
+        See below for more information about the `data` and `target` object.
+
+        .. versionadded:: 0.18
+
+    as_frame : bool, default=False
+        If True, the data is a pandas DataFrame including columns with
+        appropriate dtypes (numeric, string or categorical). The target is
+        a pandas DataFrame or Series depending on the number of target columns.
+        If `return_X_y` is True, then (`data`, `target`) will be pandas
+        DataFrames or Series as described below.
+
+        .. versionadded:: 0.23
+
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
+
+        data : {ndarray, dataframe} of shape (20, 3)
+            The data matrix. If `as_frame=True`, `data` will be a pandas
+            DataFrame.
+        target: {ndarray, dataframe} of shape (20, 3)
+            The regression targets. If `as_frame=True`, `target` will be
+            a pandas DataFrame.
+        feature_names: list
+            The names of the dataset columns.
+        target_names: list
+            The names of the target columns.
+        frame: DataFrame of shape (20, 6)
+            Only present when `as_frame=True`. DataFrame with `data` and
+            `target`.
+
+            .. versionadded:: 0.23
+        DESCR: str
+            The full description of the dataset.
+        data_filename: str
+            The path to the location of the data.
+        target_filename: str
+            The path to the location of the target.
+
+            .. versionadded:: 0.20
+
+    (data, target) : tuple if ``return_X_y`` is True
+        Returns a tuple of two ndarrays or dataframe of shape
+        `(20, 3)`. Each row represents one sample and each column represents the
+        features in `X` and a target in `y` of a given sample.
+
+        .. versionadded:: 0.18
+
+    Examples
+    --------
+    >>> from sklearn.datasets import load_linnerud
+    >>> linnerud = load_linnerud()
+    >>> linnerud.data.shape
+    (20, 3)
+    >>> linnerud.target.shape
+    (20, 3)
+    """
+    data_filename = "linnerud_exercise.csv"
+    target_filename = "linnerud_physiological.csv"
+
+    data_module_path = resources.files(DATA_MODULE)
+    # Read header and data
+    data_path = data_module_path / data_filename
+    with data_path.open("r", encoding="utf-8") as f:
+        header_exercise = f.readline().split()
+        f.seek(0)  # reset file obj
+        data_exercise = np.loadtxt(f, skiprows=1)
+
+    target_path = data_module_path / target_filename
+    with target_path.open("r", encoding="utf-8") as f:
+        header_physiological = f.readline().split()
+        f.seek(0)  # reset file obj
+        data_physiological = np.loadtxt(f, skiprows=1)
+
+    fdescr = load_descr("linnerud.rst")
+
+    frame = None
+    if as_frame:
+        (frame, data_exercise, data_physiological) = _convert_data_dataframe(
+            "load_linnerud",
+            data_exercise,
+            data_physiological,
+            header_exercise,
+            header_physiological,
+        )
+    if return_X_y:
+        return data_exercise, data_physiological
+
+    return Bunch(
+        data=data_exercise,
+        feature_names=header_exercise,
+        target=data_physiological,
+        target_names=header_physiological,
+        frame=frame,
+        DESCR=fdescr,
+        data_filename=data_filename,
+        target_filename=target_filename,
+        data_module=DATA_MODULE,
+    )
+
+
+def load_sample_images():
+    """Load sample images for image manipulation.
+
+    Loads both, ``china`` and ``flower``.
+
+    Read more in the :ref:`User Guide <sample_images>`.
+
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
+
+        images : list of ndarray of shape (427, 640, 3)
+            The two sample image.
+        filenames : list
+            The filenames for the images.
+        DESCR : str
+            The full description of the dataset.
+
+    Examples
+    --------
+    To load the data and visualize the images:
+
+    >>> from sklearn.datasets import load_sample_images
+    >>> dataset = load_sample_images()     #doctest: +SKIP
+    >>> len(dataset.images)                #doctest: +SKIP
+    2
+    >>> first_img_data = dataset.images[0] #doctest: +SKIP
+    >>> first_img_data.shape               #doctest: +SKIP
+    (427, 640, 3)
+    >>> first_img_data.dtype               #doctest: +SKIP
+    dtype('uint8')
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        raise ImportError(
+            "The Python Imaging Library (PIL) is required to load data "
+            "from jpeg files. Please refer to "
+            "https://pillow.readthedocs.io/en/stable/installation.html "
+            "for installing PIL."
+        )
+
+    descr = load_descr("README.txt", descr_module=IMAGES_MODULE)
+
+    filenames, images = [], []
+
+    jpg_paths = sorted(
+        resource
+        for resource in resources.files(IMAGES_MODULE).iterdir()
+        if resource.is_file() and resource.match("*.jpg")
+    )
+
+    for path in jpg_paths:
+        filenames.append(str(path))
+        with path.open("rb") as image_file:
+            pil_image = Image.open(image_file)
+            image = np.asarray(pil_image)
+        images.append(image)
+
+    return Bunch(images=images, filenames=filenames, DESCR=descr)
+
+
+@validate_params(
+    {
+        "image_name": [StrOptions({"china.jpg", "flower.jpg"})],
+    },
+    prefer_skip_nested_validation=True,
+)
+def load_sample_image(image_name):
+    """Load the numpy array of a single sample image.
+
+    Read more in the :ref:`User Guide <sample_images>`.
+
+    Parameters
+    ----------
+    image_name : {`china.jpg`, `flower.jpg`}
+        The name of the sample image loaded.
+
+    Returns
+    -------
+    img : 3D array
+        The image as a numpy array: height x width x color.
+
+    Examples
+    --------
+
+    >>> from sklearn.datasets import load_sample_image
+    >>> china = load_sample_image('china.jpg')   # doctest: +SKIP
+    >>> china.dtype                              # doctest: +SKIP
+    dtype('uint8')
+    >>> china.shape                              # doctest: +SKIP
+    (427, 640, 3)
+    >>> flower = load_sample_image('flower.jpg') # doctest: +SKIP
+    >>> flower.dtype                             # doctest: +SKIP
+    dtype('uint8')
+    >>> flower.shape                             # doctest: +SKIP
+    (427, 640, 3)
+    """
+    images = load_sample_images()
+    index = None
+    for i, filename in enumerate(images.filenames):
+        if filename.endswith(image_name):
+            index = i
+            break
+    if index is None:
+        raise AttributeError("Cannot find sample image: %s" % image_name)
+    return images.images[index]
+
+
+def _pkl_filepath(*args, **kwargs):
+    """Return filename for Python 3 pickles
+
+    args[-1] is expected to be the ".pkl" filename. For compatibility with
+    older scikit-learn versions, a suffix is inserted before the extension.
+
+    _pkl_filepath('/path/to/folder', 'filename.pkl') returns
+    '/path/to/folder/filename_py3.pkl'
+
+    """
+    py3_suffix = kwargs.get("py3_suffix", "_py3")
+    basename, ext = splitext(args[-1])
+    basename += py3_suffix
+    new_args = args[:-1] + (basename + ext,)
+    return join(*new_args)
+
+
+def _sha256(path):
+    """Calculate the sha256 hash of the file at path."""
+    sha256hash = hashlib.sha256()
+    chunk_size = 8192
+    with open(path, "rb") as f:
+        while True:
+            buffer = f.read(chunk_size)
+            if not buffer:
+                break
+            sha256hash.update(buffer)
+    return sha256hash.hexdigest()
+
+
+def _fetch_remote(remote, dirname=None, n_retries=3, delay=1):
+    """Helper function to download a remote dataset into path
+
+    Fetch a dataset pointed by remote's url, save into path using remote's
+    filename and ensure its integrity based on the SHA256 Checksum of the
+    downloaded file.
+
+    Parameters
+    ----------
+    remote : RemoteFileMetadata
+        Named tuple containing remote dataset meta information: url, filename
+        and checksum
+
+    dirname : str
+        Directory to save the file to.
+
+    n_retries : int, default=3
+        Number of retries when HTTP errors are encountered.
+
+        .. versionadded:: 1.5
+
+    delay : int, default=1
+        Number of seconds between retries.
+
+        .. versionadded:: 1.5
+
+    Returns
+    -------
+    file_path: str
+        Full path of the created file.
+    """
+
+    file_path = remote.filename if dirname is None else join(dirname, remote.filename)
+    while True:
+        try:
+            urlretrieve(remote.url, file_path)
+            break
+        except (URLError, TimeoutError):
+            if n_retries == 0:
+                # If no more retries are left, re-raise the caught exception.
+                raise
+            warnings.warn(f"Retry downloading from url: {remote.url}")
+            n_retries -= 1
+            time.sleep(delay)
+
+    checksum = _sha256(file_path)
+    if remote.checksum != checksum:
+        raise OSError(
+            "{} has an SHA256 checksum ({}) "
+            "differing from expected ({}), "
+            "file may be corrupted.".format(file_path, checksum, remote.checksum)
+        )
+    return file_path
